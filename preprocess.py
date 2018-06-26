@@ -6,15 +6,20 @@ import tensorflow.contrib.signal as signal
 import re
 
 # read audio
-def read(path, sr=22050, mono=True):
+def read(path, sr=22050, mono=True, fix_length=None):
     y, sr = librosa.core.load(path, sr=sr, mono=mono)
-    return y, sr
+    if fix_length:
+        if fix_length > len(y):
+            y = np.pad(y, (0, fix_length-len(y)), 'constant', constant_values=0)
+        else:
+            y = y[:fix_length]
+    return y
 
 # write wav
-def write(path, y, sr=22050):
+def save(path, y, sr=22050):
     if not path.endswith('.wav'):
         path += '.wav'
-    librosa.output.write_wav(path, y, sr)
+    librosa.output.write_wav(path, y, sr, norm=True)
 
 
 # pad and crop audio sources into the given duration
@@ -93,6 +98,18 @@ def random_crop_2D_tensors(input, frames=256):
     tf.logging.debug('in random_crio_2D_tensors, output tensor shape: {}'.format(output.get_shape()))
     return output
 
+def read_eval_input_list(input_list):
+    data_list = []
+    anno_list = []
+    dir_path = os.path.dirname(input_list)
+    with open(input_list, 'r') as f:
+        for line in f:
+            l = line.split('\t')[:-1]
+            data_list.append(os.path.join(dir_path, l[0]))
+            anno_list.append([ os.path.join(dir_path, n) for n in l[1:] ])
+
+
+    return data_list, anno_list
 
 def read_training_input_list(input_list):
     data_list = []
@@ -115,34 +132,78 @@ def get_samples(hop=256, n_fft=1024, frames=256):
     
     return hop * (frames-1) + n_fft
 
-
-def get_input_tensor(data, hop=256, n_fft=1024, frames=256):
+def get_input_data(filename, sr=8192, n_fft=1024, hop=256, frames=128, overlap=64):
+    # read data
+    y, sr = librosa.core.load(filename, sr=sr, mono=True)
+    y_samples = y.shape[-1]
+    y = librosa.util.fix_length(y, y_samples + n_fft//2)
+    y = librosa.core.stft(y, n_fft=n_fft, hop_length=hop, window='hann')
     
-    samples = get_samples(hop, n_fft, frames)
+    _hop = frames - overlap
 
-    input_spec = tf.contrib.signal.stft(data, frame_length=n_fft,
-                                        frame_step=hop, fft_length=n_fft,
-                                        window_fn=tf.contrib.signal.hann_window, name='stft')
+    # padding
+    y_length = y.shape[-1]
+    _hop = frames - overlap
+    pad = frames - _hop - y_length % _hop
+    #pad = frames - y_length % frames
+    pad_shape = [ (0,0) for n in range(len(y.shape)-1) ]
+    pad_shape.append((0, pad))
+    y_pad = np.pad(y, tuple(pad_shape), 'constant', constant_values=0)
 
-    tf.logging.debug('in get_input_tensor, input_spec shape: {}'.format(input_spec.get_shape()))
+    y_length = y_pad.shape[-1]
+
+    tf.logging.info('Input data shape: {} / padded: {}'.format(y.shape, y_pad.shape))
+
+    # crop
+    y_list = np.array([ y_pad[..., s:s+frames ] for s in range(0, y_length-overlap, _hop) ])
+
+    return y_list, pad, y_samples
+
+
+def get_input_tensor(n_fft=1024, hop=256, frames=128):
+
+    input_tensor = tf.placeholder(dtype=tf.float32, shape=[n_fft//2+1, frames])
+
+    resized_tensor = tf.expand_dims(input_tensor, 0)
+    resized_tensor = tf.expand_dims(resized_tensor, -1)
+
+    input_magni = tf.abs(resized_tensor)
+    input_phase = tf.angle(resized_tensor)
+
+    norm = tf.maximum(tf.sqrt(tf.reduce_max(tf.square(input_magni))), 1e-8)
+    input_magni = input_magni/norm
     
-    # magnitude spectrogram
-    input_magni = tf.abs(input_spec)
-    input_phase = tf.angle(input_spec)
+    return input_tensor, input_magni, input_phase, norm
 
-    # [channels, frames, freq_bins] -> [channels, freq_bins, frames]
-    input_magni = tf.tranpose(input_magni, [0, 2, 1])
-    input_phase = tf.transpose(input_phase, [0, 2, 1])
+def reconstruct_spectrum(input_magni, input_phase, frames=128, overlap=64, clip=0):
+    y = None
+    multp = None
+    hop = frames - overlap
 
-    # split data
-    data_magni = tf.slice(input_magni, [0, 0, 0], [1, -1, -1])
-    data_phase = tf.slice(input_phase, [0, 0, 0], [1, -1, -1])
-    
-    data_magni.set_shape([1, n_fft//2+1, frames])
-    data_phase.set_shape([1, n_fft//2+1, frames])
+    for idx, (magni, phase) in enumerate(zip(input_magni, input_phase)):
 
-    return data_magni, data_phase
+        if y is None:
+            shape=( magni.shape[0], hop*len(input_magni)+overlap )
+            y = np.zeros(shape=shape, dtype=np.complex128)
+            multp = np.zeros(shape=shape, dtype=np.float)
 
+        y[:, idx*hop:idx*hop+frames] += magni * np.exp(1j*phase)
+        multp[:, idx*hop:idx*hop+frames] += 1.
+
+    y = y/multp
+
+    assert np.isnan(y).any() == False
+
+    return y[:, :y.shape[1]-clip]
+
+
+def reconstruct_audio(input_spec, hop=256, fix_length=None):
+    y = librosa.core.istft(input_spec, hop_length=hop)
+    if fix_length:
+        y = librosa.util.fix_length(y, fix_length)
+    return y
+
+   
 
 
 def get_training_input_tensors(data_list, anno_list, hop=256, n_fft=1024, frames=256, batch_size=32):
